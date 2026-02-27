@@ -227,22 +227,32 @@ func (c *LSPClient) WriteMsg(t *testing.T, msg *lsproto.Message) {
 	}
 }
 
-// SendRequest sends a typed request and waits for the response.
-func SendRequest[Params, Resp any](t *testing.T, c *LSPClient, info lsproto.RequestInfo[Params, Resp], params Params) (*lsproto.Message, Resp, bool) {
+// StartRequest sends a typed request and guarantees the request has been sent but does not wait for the response. Call the returned function to wait for the response.
+func StartRequest[Params, Resp any](t *testing.T, c *LSPClient, info lsproto.RequestInfo[Params, Resp], params Params) func() (*lsproto.Message, Resp, bool) {
 	id := c.NextID()
 	reqID := lsproto.NewID(lsproto.IntegerOrString{Integer: &id})
 	req := info.NewRequestMessage(reqID, params)
 
-	resp, ok := c.SendRequestWorker(t, req, reqID)
-	if !ok {
-		return nil, *new(Resp), false
+	wait := c.StartRequestWorker(t, req, reqID)
+
+	return func () (*lsproto.Message, Resp, bool) {
+		resp, ok := wait()
+		if !ok {
+			return nil, *new(Resp), false
+		}
+		result, ok := resp.Result.(Resp)
+		return resp.Message(), result, ok
 	}
-	result, ok := resp.Result.(Resp)
-	return resp.Message(), result, ok
 }
 
-// This is an untyped version of SendRequest. Prefer to use SendRequest when possible.
-func (c *LSPClient) SendRequestWorker(t *testing.T, req *lsproto.RequestMessage, reqID *jsonrpc.ID) (*lsproto.ResponseMessage, bool) {
+// SendRequest sends a typed request and waits for the response.
+func SendRequest[Params, Resp any](t *testing.T, c *LSPClient, info lsproto.RequestInfo[Params, Resp], params Params) (*lsproto.Message, Resp, bool) {
+	wait := StartRequest(t, c, info, params)
+	return wait()
+}
+
+// This is an untyped version of StartRequest. Prefer to use SendRequest when possible.
+func (c *LSPClient) StartRequestWorker(t *testing.T, req *lsproto.RequestMessage, reqID *jsonrpc.ID) func() (*lsproto.ResponseMessage, bool) {
 	// Create response channel and register it
 	responseChan := make(chan *lsproto.ResponseMessage, 1)
 	c.pendingRequestsMu.Lock()
@@ -252,23 +262,31 @@ func (c *LSPClient) SendRequestWorker(t *testing.T, req *lsproto.RequestMessage,
 	// Send the request
 	c.WriteMsg(t, req.Message())
 
-	// Wait for response with context
-	ctx := t.Context()
-	var resp *lsproto.ResponseMessage
-	select {
-	case <-ctx.Done():
-		c.pendingRequestsMu.Lock()
-		delete(c.pendingRequests, *reqID)
-		c.pendingRequestsMu.Unlock()
-		t.Fatalf("Request cancelled: %v", ctx.Err())
-		return nil, false
-	case resp = <-responseChan:
-		if resp == nil {
+	return func() (*lsproto.ResponseMessage, bool) {
+		// Wait for response with context
+		ctx := t.Context()
+		var resp *lsproto.ResponseMessage
+		select {
+		case <-ctx.Done():
+			c.pendingRequestsMu.Lock()
+			delete(c.pendingRequests, *reqID)
+			c.pendingRequestsMu.Unlock()
+			t.Fatalf("Request cancelled: %v", ctx.Err())
 			return nil, false
+		case resp = <-responseChan:
+			if resp == nil {
+				return nil, false
+			}
 		}
-	}
 
-	return resp, true
+		return resp, true
+	}
+}
+
+// This is an untyped version of SendRequest. Prefer to use SendRequest when possible.
+func (c *LSPClient) SendRequestWorker(t *testing.T, req *lsproto.RequestMessage, reqID *jsonrpc.ID) (*lsproto.ResponseMessage, bool) {
+	wait := c.StartRequestWorker(t, req, reqID)
+	return wait()
 }
 
 // SendNotification sends a typed notification.
